@@ -311,3 +311,5 @@ yarl==1.20.0
     # via aiohttp
 zstandard==0.23.0
     # via langsmith
+
+mangum>=0.17.0
