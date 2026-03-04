@@ -1,0 +1,40 @@
+{
+  "name": "rag-app-build",
+  "source": {
+    "type": "CODEPIPELINE",
+    "buildspec": "buildspec.yml"
+  },
+  "artifacts": {
+    "type": "CODEPIPELINE"
+  },
+  "environment": {
+    "type": "LINUX_CONTAINER",
+    "image": "aws/codebuild/standard:7.0",
+    "computeType": "BUILD_GENERAL1_SMALL",
+    "privilegedMode": true,
+    "environmentVariables": [
+      {
+        "name": "AWS_DEFAULT_REGION",
+        "value": "ap-south-1",
+        "type": "PLAINTEXT"
+      },
+      {
+        "name": "AWS_ACCOUNT_ID",
+        "value": "946769779691",
+        "type": "PLAINTEXT"
+      },
+      {
+        "name": "IMAGE_REPO_NAME",
+        "value": "rag-app",
+        "type": "PLAINTEXT"
+      }
+    ]
+  },
+  "serviceRole": "arn:aws:iam::946769779691:role/rag-app-codebuild-role",
+  "logsConfig": {
+    "cloudWatchLogs": {
+      "status": "ENABLED",
+      "groupName": "/aws/codebuild/rag-app-build"
+    }
+  }
+}
