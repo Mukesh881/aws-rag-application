@@ -1,0 +1,141 @@
+# Dockerfile for AWS Lambda Deployment
+# =====================================
+# This Dockerfile creates a container image specifically designed to run in AWS Lambda.
+# 
+# Why Lambda needs a special base image:
+# - Lambda has a custom runtime that expects specific entry points
+# - The Lambda Runtime Interface Client (RIC) handles communication between Lambda service and your code
+# - Standard Python images won't work because they lack the Lambda integration layer
+#
+# Image Layers Explained:
+# Each instruction creates a new layer in the Docker image. Layers are cached, so:
+# - If you only change application code, only the final layers rebuild (fast!)
+# - If you change dependencies, everything after that step rebuilds (slower)
+# - Order matters: put stable things (base image, deps) first, changing things (code) last
+
+# =============================================================
+# BASE IMAGE: AWS Lambda Python Runtime
+# =============================================================
+# This is AWS's official Python 3.11 image for Lambda
+# It includes:
+#   - Python 3.11 interpreter
+#   - Lambda Runtime Interface Client (RIC) for Lambda integration
+#   - Amazon Linux 2 base OS
+#   - Pre-configured Lambda environment variables
+FROM public.ecr.aws/lambda/python:3.11
+
+# =============================================================
+# WORKING DIRECTORY
+# =============================================================
+# ${LAMBDA_TASK_ROOT} is an environment variable set by the base image
+# Default value: /var/task
+# This is where Lambda expects your code to live
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+# =============================================================
+# INSTALL PYTHON DEPENDENCIES
+# =============================================================
+# Why copy requirements.txt separately before copying all code?
+# Answer: Docker layer caching optimization!
+# 
+# If we copied all files first, then ANY code change would invalidate the layer
+# and force a complete dependency reinstall (slow - can take 2-3 minutes).
+# 
+# By copying requirements.txt first:
+#   - Docker caches the dependency installation layer
+#   - Only reinstalls if requirements.txt changes
+#   - Code changes don't trigger dependency reinstall
+#   - Builds are much faster (30 seconds vs 3 minutes)
+
+# Copy only the requirements file
+COPY requirements.txt .
+
+# Install Python packages
+# Flags explained:
+#   --no-cache-dir: Don't save pip's download cache (reduces image size by ~50MB)
+#   -r: Install from requirements file
+# 
+# Security Note: In production, consider:
+#   - Using pip install --require-hashes for supply chain security
+#   - Scanning dependencies with safety or pip-audit
+#   - Pinning exact versions (==) instead of flexible versions (>=)
+RUN pip install --no-cache-dir -r requirements.txt
+
+# =============================================================
+# COPY APPLICATION CODE
+# =============================================================
+# Now copy the actual application source code
+# This layer will rebuild whenever you change any Python file
+
+# Copy the main application module
+COPY src/ ${LAMBDA_TASK_ROOT}/src/
+
+# Copy data files (sample documents for RAG ingestion)
+# Note: In production, you might want to:
+#   - Store documents in S3 instead of bundling in image
+#   - Use Lambda layers for large static files
+#   - Mount EFS for dynamic file storage
+COPY data/ ${LAMBDA_TASK_ROOT}/data/
+
+# =============================================================
+# ENVIRONMENT VARIABLES
+# =============================================================
+# Set Python-specific environment variables for better behavior
+
+# PYTHONUNBUFFERED=1
+# Why? Forces Python to write stdout/stderr immediately (unbuffered)
+# Without this: Logs might be delayed or lost if Lambda times out
+# With this: See real-time logs in CloudWatch
+ENV PYTHONUNBUFFERED=1
+
+# PYTHONPATH
+# Why? Tells Python where to find modules
+# This ensures 'import src.app' works correctly
+# Without this: You'd get "ModuleNotFoundError: No module named 'src'"
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}
+
+# =============================================================
+# LAMBDA HANDLER CONFIGURATION
+# =============================================================
+# CMD instruction tells Lambda which function to invoke
+# Format: <module_path>.<function_name>
+# 
+# In our case:
+#   - Module: src/lambda_handler.py
+#   - Function: handler
+#   - Full path: src.lambda_handler.handler
+# 
+# What happens when Lambda invokes this:
+# 1. Lambda runtime loads src/lambda_handler.py module
+# 2. Calls the handler() function with (event, context) parameters
+# 3. Mangum (inside handler) converts Lambda event → ASGI request
+# 4. FastAPI processes the request
+# 5. Mangum converts FastAPI response → Lambda response format
+# 6. Lambda returns response to caller (API Gateway, Function URL, etc.)
+CMD ["src.lambda_handler.handler"]
+
+# =============================================================
+# IMAGE SIZE OPTIMIZATION NOTES
+# =============================================================
+# Current image size: ~1.5 GB (with all dependencies)
+# 
+# Ways to reduce size (if needed):
+# 1. Use multi-stage builds to exclude build tools
+# 2. Remove unnecessary dependencies from requirements.txt
+# 3. Use slim Python base images (but Lambda base is already optimized)
+# 4. Compress large files
+# 5. Use Lambda layers for large dependencies (boto3, numpy, etc.)
+# 
+# Trade-off: Smaller images = faster cold starts, but optimization takes time
+# For Lambda: Cold start is dominated by Python import time, not download time
+
+# =============================================================
+# SECURITY BEST PRACTICES
+# =============================================================
+# Production recommendations:
+# 1. Run as non-root user (Lambda base image already does this)
+# 2. Scan for vulnerabilities: docker scan <image-name>
+# 3. Use AWS ECR image scanning (enabled in the setup guide)
+# 4. Keep base image updated: aws ecr describe-images --repository-name lambda/python
+# 5. Use secrets management: Store API keys in AWS Secrets Manager, not in image
+# 6. Implement least-privilege IAM: Only grant Lambda necessary permissions
