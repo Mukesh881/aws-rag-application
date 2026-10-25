@@ -5,14 +5,13 @@ botocore
 # Vector database
 pinecone
 
-# LangChain for text processing
-langchain
-langchain-community
+# LangChain text splitter (chunking only)
 langchain-text-splitters
 
 # Web framework
 fastapi
 uvicorn[standard]
+mangum  # Lambda <-> ASGI adapter
 
 # Configuration management
 pydantic
@@ -21,7 +20,6 @@ python-dotenv
 
 # Text processing and utilities
 tiktoken
-unstructured
 
 # Logging and monitoring
 structlog
@@ -30,8 +28,9 @@ structlog
 pytest
 pytest-asyncio
 httpx  # For testing FastAPI
+requests  # scripts/test_api.py
 
-# Optional: For enhanced document processing
+# Document parsing (PDF / DOCX ingestion)
 pypdf
 python-docx
 openpyxl

@@ -91,7 +91,6 @@ Create a `.env` file in the project root:
 ```bash
 # Required - Pinecone Configuration
 PINECONE_API_KEY=your_pinecone_api_key
-PINECONE_ENVIRONMENT=your_environment  # e.g., "us-east-1-aws"
 PINECONE_INDEX_NAME=rag-demo-index
 
 # Optional - AWS Configuration (if not using AWS CLI)
@@ -123,10 +122,10 @@ Copy the configuration example above to a `.env` file and update with your value
 ### 3. Ingest Documents
 ```bash
 # Ingest from local data directory
-python src/ingest.py --source-type local --path ./data
+python -m src.ingest --source-type local --path ./data
 
 # Or ingest from S3 bucket
-python src/ingest.py --source-type s3 --path your-bucket-name --s3-prefix documents/
+python -m src.ingest --source-type s3 --path your-bucket-name --s3-prefix documents/
 ```
 
 ### 4. Start the API Server
@@ -180,8 +179,11 @@ curl -X POST "http://localhost:8000/query" \
 }
 ```
 
+### Liveness
+**GET** `/live` — process is up; makes no Bedrock or Pinecone calls (use for container health checks).
+
 ### Health Check
-**GET** `/health`
+**GET** `/health` — checks Bedrock and Pinecone; cached for `HEALTH_CACHE_SECONDS`.
 ```json
 {
   "status": "healthy",
@@ -273,22 +275,27 @@ copilot svc deploy --name api --env production
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PINECONE_API_KEY` | ✅ | - | Pinecone API key |
-| `PINECONE_ENVIRONMENT` | ✅ | - | Pinecone environment (e.g., "us-east-1-aws") |
+| `PINECONE_API_KEY` | ✅* | - | Pinecone API key |
+| `PINECONE_API_KEY_SECRET_ID` | ✅* | - | Secrets Manager secret holding the Pinecone key (plain string, or JSON with `PINECONE_API_KEY`). *Set this or `PINECONE_API_KEY` |
 | `PINECONE_INDEX_NAME` | ❌ | "rag-demo-index" | Name of the Pinecone index |
-| `AWS_REGION` | ❌ | "us-east-1" | AWS region for Bedrock |
+| `AWS_REGION` | ❌ | "us-east-1" | AWS region for S3 and Secrets Manager (Lambda sets this automatically) |
+| `BEDROCK_REGION` | ❌ | "us-east-1" | Region for Bedrock calls; must match the LLM's inference profile prefix (`us.`, `eu.`, `apac.`) |
 | `BEDROCK_EMBED_MODEL_ID` | ❌ | "amazon.titan-embed-text-v2:0" | Embedding model |
-| `BEDROCK_LLM_MODEL_ID` | ❌ | "anthropic.claude-3-sonnet-20240229-v1:0" | LLM model |
+| `BEDROCK_LLM_MODEL_ID` | ❌ | "us.anthropic.claude-sonnet-4-20250514-v1:0" | LLM model |
 | `CHUNK_SIZE` | ❌ | 800 | Characters per text chunk |
 | `CHUNK_OVERLAP` | ❌ | 100 | Overlap between chunks |
 | `TOP_K` | ❌ | 6 | Number of chunks to retrieve |
-| `SIMILARITY_THRESHOLD` | ❌ | 0.7 | Minimum similarity score |
+| `SIMILARITY_THRESHOLD` | ❌ | 0.5 | Minimum similarity score |
+| `EMBED_CONCURRENCY` | ❌ | 8 | Parallel embedding requests during ingestion |
+| `API_KEY` | ❌ | - | If set, `/query` and `/stats` require it in the `X-API-Key` header |
+| `CORS_ALLOW_ORIGINS` | ❌ | "*" | Comma-separated allowed origins (credentials are only allowed with explicit origins) |
+| `HEALTH_CACHE_SECONDS` | ❌ | 60 | How long `/health` reuses its last dependency check |
 
 ### Model Configuration
 
 #### Supported Embedding Models
 - `amazon.titan-embed-text-v2:0` (1024 dimensions) - **Recommended**
-- `amazon.titan-embed-text-v1` (1024 dimensions)
+- `amazon.titan-embed-text-v1` (1536 dimensions; needs a 1536-dim index)
 
 #### Supported LLM Models
 - `anthropic.claude-3-sonnet-20240229-v1:0` - **Recommended**
@@ -367,7 +374,7 @@ curl -X POST http://localhost:8000/query \
 Make sure you're running commands from the project root directory:
 ```bash
 # From project root
-python src/ingest.py
+python -m src.ingest
 python src/app.py
 ```
 
@@ -397,11 +404,11 @@ export AWS_REGION=us-east-1
 # Check data directory exists
 ls -la data/
 
-# Verify files are .txt format
-find data/ -name "*.txt"
+# Verify files are a supported format (.txt, .md, .pdf, .docx)
+find data/ -name "*.txt" -o -name "*.md" -o -name "*.pdf" -o -name "*.docx"
 
 # Run ingestion with verbose logging
-python src/ingest.py --source-type local --path ./data --log-level DEBUG
+python -m src.ingest --source-type local --path ./data --log-level DEBUG
 ```
 
 ### Debug Mode
@@ -490,6 +497,8 @@ This project is provided as-is for educational and consulting purposes. Please r
 
 ---
 
-**🎯 Ready to get started?** Run `python scripts/quickstart.py` and follow the interactive setup!#   C I / C D   P i p e l i n e   C o m p l e t e !  
- #   W e b h o o k   t e s t  
+**🎯 Ready to get started?** Run `python scripts/quickstart.py` and follow the interactive setup!#   C I / C D   P i p e l i n e   C o m p l e t e ! 
+ 
+ #   W e b h o o k   t e s t 
+ 
  

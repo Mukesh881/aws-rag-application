@@ -49,7 +49,7 @@ def check_dependencies():
         "pinecone": "pinecone",
         "fastapi": "fastapi",
         "uvicorn": "uvicorn",
-        "langchain": "langchain",
+        "langchain-text-splitters": "langchain_text_splitters",
         "pydantic": "pydantic",
         "structlog": "structlog"
     }
@@ -77,26 +77,29 @@ def check_environment_variables():
     """Check if required environment variables are set."""
     print("\n🔍 Checking environment variables...")
     
+    # Each entry is satisfied by any one of its variables
     required_vars = [
-        "PINECONE_API_KEY",
-        "PINECONE_ENVIRONMENT"
+        ("PINECONE_API_KEY", "PINECONE_API_KEY_SECRET_ID"),
     ]
-    
+
     optional_vars = [
         "AWS_REGION",
+        "BEDROCK_REGION",
         "PINECONE_INDEX_NAME",
         "BEDROCK_EMBED_MODEL_ID",
         "BEDROCK_LLM_MODEL_ID"
     ]
-    
+
     missing_required = []
-    
-    for var in required_vars:
-        if os.getenv(var):
-            print(f"✅ {var}")
+
+    for options in required_vars:
+        found = next((var for var in options if os.getenv(var)), None)
+        if found:
+            print(f"✅ {found}")
         else:
-            print(f"❌ {var} - Not set")
-            missing_required.append(var)
+            label = " or ".join(options)
+            print(f"❌ {label} - Not set")
+            missing_required.append(label)
     
     for var in optional_vars:
         if os.getenv(var):

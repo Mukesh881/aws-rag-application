@@ -16,13 +16,14 @@
 # =============================================================
 # BASE IMAGE: AWS Lambda Python Runtime
 # =============================================================
-# This is AWS's official Python 3.11 image for Lambda
+# This is AWS's official Python 3.12 image for Lambda
+# (must match the Python version requirements.txt is compiled for)
 # It includes:
-#   - Python 3.11 interpreter
+#   - Python 3.12 interpreter
 #   - Lambda Runtime Interface Client (RIC) for Lambda integration
-#   - Amazon Linux 2 base OS
+#   - Amazon Linux 2023 base OS
 #   - Pre-configured Lambda environment variables
-FROM public.ecr.aws/lambda/python:3.11
+FROM public.ecr.aws/lambda/python:3.12
 
 # =============================================================
 # WORKING DIRECTORY
@@ -117,7 +118,7 @@ CMD ["src.lambda_handler.handler"]
 # =============================================================
 # IMAGE SIZE OPTIMIZATION NOTES
 # =============================================================
-# Current image size: ~1.5 GB (with all dependencies)
+# Image size is dominated by Python dependencies; keep requirements.in lean
 # 
 # Ways to reduce size (if needed):
 # 1. Use multi-stage builds to exclude build tools
