@@ -33,9 +33,9 @@ USER appuser
 # Expose port
 EXPOSE 8000
 
-# Health check with longer start period for model loading
+# Liveness check: /live doesn't call Bedrock (/health does, and is billed)
 HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/live || exit 1
 
 # Set environment variables
 ENV PYTHONPATH=/app

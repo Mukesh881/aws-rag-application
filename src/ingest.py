@@ -4,93 +4,105 @@ Data ingestion script for the RAG pipeline.
 This script processes documents from S3 or local storage, chunks them,
 generates embeddings using AWS Bedrock, and stores them in Pinecone.
 """
+import io
 import json
 import logging
 import pathlib
 import sys
-from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Any
 from datetime import datetime, UTC
 import hashlib
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
-from langchain_community.document_loaders import TextLoader
+import docx
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
+from pypdf import PdfReader
 import structlog
 
 from .config import get_settings
+from .utils import configure_logging, create_bedrock_client, serialize_index_stats
 
-# Configure structured logging
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
+configure_logging()
 
 logger = structlog.get_logger()
+
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
+
+# Pinecone accepts at most 1000 IDs per delete request
+PINECONE_DELETE_BATCH = 1000
+
+
+def extract_text(file_name: str, data: bytes) -> str:
+    """
+    Extract plain text from a document's raw bytes based on its extension.
+
+    Args:
+        file_name: File name or key, used to pick the parser
+        data: Raw file content
+
+    Returns:
+        Extracted text (may be empty, e.g. for a scanned PDF without a text layer)
+    """
+    suffix = pathlib.PurePosixPath(file_name).suffix.lower()
+    if suffix in (".txt", ".md"):
+        return data.decode("utf-8")
+    if suffix == ".pdf":
+        reader = PdfReader(io.BytesIO(data))
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    if suffix == ".docx":
+        document = docx.Document(io.BytesIO(data))
+        parts = [paragraph.text for paragraph in document.paragraphs]
+        for table in document.tables:
+            for row in table.rows:
+                parts.append(" | ".join(cell.text.strip() for cell in row.cells))
+        return "\n".join(parts)
+    raise ValueError(f"Unsupported file type: {suffix or file_name}")
 
 
 class DocumentIngester:
     """Handles document ingestion into the RAG pipeline."""
-    
+
     def __init__(self):
         """Initialize the ingester with AWS and Pinecone clients."""
         self.settings = get_settings()
         self._setup_clients()
         self._setup_text_splitter()
-    
+
     def _setup_clients(self):
         """Initialize AWS Bedrock and Pinecone clients."""
         try:
             # Initialize Bedrock client
-            self.bedrock_client = boto3.client(
-                "bedrock-runtime",
-                region_name=self.settings.bedrock_region
-            )
+            self.bedrock_client = create_bedrock_client(self.settings.bedrock_region)
             logger.info("Bedrock client initialized", region=self.settings.bedrock_region)
-            
+
             # Initialize Pinecone client
-            self.pinecone_client = Pinecone(
-                api_key=self.settings.pinecone_api_key,
-                environment=self.settings.pinecone_environment
-            )
+            self.pinecone_client = Pinecone(api_key=self.settings.pinecone_api_key)
             self.pinecone_index = self.pinecone_client.Index(self.settings.pinecone_index_name)
             logger.info("Pinecone client initialized", index=self.settings.pinecone_index_name)
-            
-            # Test Bedrock connection
-            self._test_bedrock_connection()
-            
+
+            # Test Bedrock connection and check it matches the index
+            self._validate_embedding_dimension()
+
         except NoCredentialsError:
             logger.error("AWS credentials not found. Please configure AWS CLI or set environment variables.")
             raise
         except Exception as e:
             logger.error("Failed to initialize clients", error=str(e))
             raise
-    
-    def _test_bedrock_connection(self):
-        """Test the Bedrock connection with a simple embedding request."""
+
+    def _validate_embedding_dimension(self):
+        """
+        Embed a test string and check its size against the Pinecone index.
+
+        A mismatch (e.g. Titan v1 at 1536 dims into a 1024-dim index) would
+        otherwise only surface as upsert errors partway through ingestion.
+        """
         try:
-            test_response = self.bedrock_client.invoke_model(
-                modelId=self.settings.embed_model_id,
-                body=json.dumps({"inputText": "test"}),
-                contentType="application/json",
-                accept="application/json",
-            )
-            logger.info("Bedrock connection test successful")
+            embedding = self.generate_embedding("test")
+            logger.info("Bedrock connection test successful", embedding_dim=len(embedding))
         except ClientError as e:
             if e.response['Error']['Code'] == 'AccessDeniedException':
                 logger.error(
@@ -99,7 +111,14 @@ class DocumentIngester:
                     region=self.settings.bedrock_region
                 )
             raise
-    
+
+        index_dimension = getattr(self.pinecone_index.describe_index_stats(), "dimension", None)
+        if index_dimension and index_dimension != len(embedding):
+            raise ValueError(
+                f"Embedding model {self.settings.embed_model_id} produces {len(embedding)}-dim vectors "
+                f"but Pinecone index {self.settings.pinecone_index_name} expects {index_dimension}"
+            )
+
     def _setup_text_splitter(self):
         """Initialize the text splitter for chunking documents."""
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -112,14 +131,14 @@ class DocumentIngester:
             chunk_size=self.settings.chunk_size,
             chunk_overlap=self.settings.chunk_overlap
         )
-    
+
     def generate_embedding(self, text: str) -> List[float]:
         """
         Generate embedding for a text using Bedrock Titan.
-        
+
         Args:
             text: Input text to embed
-            
+
         Returns:
             List of embedding values
         """
@@ -130,364 +149,266 @@ class DocumentIngester:
                 contentType="application/json",
                 accept="application/json",
             )
-            
+
             response_body = json.loads(response["body"].read())
             embedding = response_body["embedding"]
-            
+
             logger.debug("Generated embedding", text_length=len(text), embedding_dim=len(embedding))
             return embedding
-            
+
         except Exception as e:
-            logger.error("Failed to generate embedding", error=str(e), text_preview=text[:100])
+            logger.error("Failed to generate embedding", error=str(e), text_length=len(text))
             raise
-    
+
     def create_document_id(self, source: str, chunk_index: int) -> str:
         """
         Create a unique document ID for a chunk.
-        
+
         Args:
             source: Source file path
             chunk_index: Index of the chunk within the document
-            
+
         Returns:
             Unique document ID
         """
         content = f"{source}:{chunk_index}"
         return hashlib.md5(content.encode()).hexdigest()
-    
-    def process_document(self, file_path: pathlib.Path) -> List[Dict[str, Any]]:
+
+    def build_chunks(self, source: str, file_name: str, file_size: int, text: str) -> List[Dict[str, Any]]:
         """
-        Process a single document into chunks with embeddings.
-        
+        Split text into chunks and embed them.
+
+        Embeddings run in parallel (EMBED_CONCURRENCY); any chunk failure fails
+        the whole document so it is never indexed with gaps.
+
         Args:
-            file_path: Path to the document file
-            
+            source: Source path or S3 URI (determines chunk IDs)
+            file_name: Base file name
+            file_size: File size in bytes
+            text: Document text
+
         Returns:
             List of processed chunks with embeddings and metadata
         """
-        logger.info("Processing document", file_path=str(file_path))
-        
-        try:
-            # Load document
-            loader = TextLoader(str(file_path), encoding='utf-8')
-            documents = loader.load()
-            
-            if not documents:
-                logger.warning("No content loaded from file", file_path=str(file_path))
-                return []
-            
-            # Split into chunks
-            chunks = self.text_splitter.split_documents(documents)
-            logger.info("Document split into chunks", file_path=str(file_path), chunk_count=len(chunks))
-            
-            processed_chunks = []
-            
-            for i, chunk in enumerate(chunks):
-                try:
-                    # Generate embedding
-                    embedding = self.generate_embedding(chunk.page_content)
-                    
-                    # Create document ID
-                    doc_id = self.create_document_id(str(file_path), i)
-                    
-                    # Prepare metadata
-                    metadata = {
-                        "text": chunk.page_content,
-                        "source": str(file_path),
-                        "chunk_index": i,
-                        "total_chunks": len(chunks),
-                        "file_name": file_path.name,
-                        "file_size": file_path.stat().st_size,
-                        "ingested_at": datetime.now(UTC).isoformat(),
-                        "text_length": len(chunk.page_content)
-                    }
-                    
-                    processed_chunks.append({
-                        "id": doc_id,
-                        "values": embedding,
-                        "metadata": metadata
-                    })
-                    
-                    logger.debug(
-                        "Processed chunk",
-                        doc_id=doc_id,
-                        chunk_index=i,
-                        text_length=len(chunk.page_content)
-                    )
-                    
-                except Exception as e:
-                    logger.error(
-                        "Failed to process chunk",
-                        file_path=str(file_path),
-                        chunk_index=i,
-                        error=str(e)
-                    )
-                    continue
-            
-            logger.info(
-                "Document processing complete",
-                file_path=str(file_path),
-                processed_chunks=len(processed_chunks)
-            )
-            
-            return processed_chunks
-            
-        except Exception as e:
-            logger.error("Failed to process document", file_path=str(file_path), error=str(e))
-            return []
-    
+        chunks = self.text_splitter.split_text(text)
+        logger.info("Document split into chunks", source=source, chunk_count=len(chunks))
+
+        with ThreadPoolExecutor(max_workers=self.settings.embed_concurrency) as pool:
+            embeddings = list(pool.map(self.generate_embedding, chunks))
+
+        ingested_at = datetime.now(UTC).isoformat()
+        return [
+            {
+                "id": self.create_document_id(source, i),
+                "values": embedding,
+                "metadata": {
+                    "text": chunk,
+                    "source": source,
+                    "chunk_index": i,
+                    "total_chunks": len(chunks),
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "ingested_at": ingested_at,
+                    "text_length": len(chunk)
+                }
+            }
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
+        ]
+
+    def _existing_chunk_count(self, source: str) -> int:
+        """Number of chunks currently indexed for a source, read from its first chunk."""
+        first_id = self.create_document_id(source, 0)
+        existing = self.pinecone_index.fetch(ids=[first_id]).vectors.get(first_id)
+        if not existing or not existing.metadata:
+            return 0
+        return int(existing.metadata.get("total_chunks", 0))
+
+    def _delete_stale_chunks(self, source: str, new_total: int, old_total: int):
+        """
+        Remove chunks left over from a previous, longer version of a document.
+
+        Chunk IDs are deterministic per (source, chunk_index), so re-ingesting
+        overwrites chunks 0..new_total-1; anything past that would otherwise
+        keep serving outdated text.
+        """
+        stale_ids = [self.create_document_id(source, i) for i in range(new_total, old_total)]
+        for i in range(0, len(stale_ids), PINECONE_DELETE_BATCH):
+            self.pinecone_index.delete(ids=stale_ids[i:i + PINECONE_DELETE_BATCH])
+        if stale_ids:
+            logger.info("Deleted stale chunks", source=source, deleted=len(stale_ids))
+
+    def ingest_document(self, source: str, file_name: str, file_size: int, data: bytes) -> int:
+        """
+        Extract, chunk, embed and upsert one document, replacing its previous version.
+
+        Args:
+            source: Source path or S3 URI (determines chunk IDs)
+            file_name: Base file name, used to pick the parser
+            file_size: File size in bytes
+            data: Raw file content
+
+        Returns:
+            Number of chunks ingested
+        """
+        logger.info("Processing document", source=source)
+
+        text = extract_text(file_name, data)
+        if not text.strip():
+            logger.warning("No text extracted from document", source=source)
+        chunks = self.build_chunks(source, file_name, file_size, text) if text.strip() else []
+
+        # Read the old chunk count before the upsert overwrites chunk 0
+        old_total = self._existing_chunk_count(source)
+        self.ingest_to_pinecone(chunks)
+        self._delete_stale_chunks(source, len(chunks), old_total)
+
+        logger.info("Document processing complete", source=source, processed_chunks=len(chunks))
+        return len(chunks)
+
     def ingest_to_pinecone(self, chunks: List[Dict[str, Any]], batch_size: int = 100):
         """
         Ingest processed chunks into Pinecone.
-        
+
         Args:
             chunks: List of processed chunks with embeddings
             batch_size: Number of chunks to upload in each batch
         """
         if not chunks:
-            logger.warning("No chunks to ingest")
             return
-        
-        logger.info("Starting Pinecone ingestion", total_chunks=len(chunks))
-        
+
         try:
             # Process in batches
             for i in range(0, len(chunks), batch_size):
                 batch = chunks[i:i + batch_size]
-                
+
                 # Prepare vectors for upsert
                 vectors = [(chunk["id"], chunk["values"], chunk["metadata"]) for chunk in batch]
-                
+
                 # Upsert to Pinecone
                 self.pinecone_index.upsert(vectors=vectors)
-                
-                logger.info(
+
+                logger.debug(
                     "Batch uploaded to Pinecone",
                     batch_start=i,
                     batch_size=len(batch),
                     total_uploaded=min(i + batch_size, len(chunks))
                 )
-            
-            logger.info("Pinecone ingestion complete", total_chunks=len(chunks))
-            
+
         except Exception as e:
             logger.error("Failed to ingest to Pinecone", error=str(e))
             raise
-    
-    def ingest_directory(self, directory_path: str):
+
+    def _log_summary(self, message: str, summary: Dict[str, int]):
+        """Log an ingestion summary together with the current index stats."""
+        try:
+            index_stats = serialize_index_stats(self.pinecone_index.describe_index_stats())
+        except Exception as e:
+            logger.warning("Failed to get index stats", error=str(e))
+            index_stats = {"error": "Unable to retrieve stats"}
+        logger.info(message, index_stats=index_stats, **summary)
+
+    def ingest_directory(self, directory_path: str) -> Dict[str, int]:
         """
-        Ingest all text files from a directory.
-        
+        Ingest all supported files from a directory.
+
         Args:
             directory_path: Path to the directory containing documents
+
+        Returns:
+            Summary with files_processed, files_failed and chunks_ingested
         """
         directory = pathlib.Path(directory_path)
-        
-        if not directory.exists():
-            logger.error("Directory does not exist", directory=str(directory))
-            return
-        
-        # Find all text files
-        text_files = list(directory.rglob("*.txt"))
-        
-        if not text_files:
-            logger.warning("No .txt files found in directory", directory=str(directory))
-            return
-        
-        logger.info("Starting directory ingestion", directory=str(directory), file_count=len(text_files))
-        
-        all_chunks = []
-        successful_files = 0
-        
-        for file_path in text_files:
+
+        if not directory.is_dir():
+            raise FileNotFoundError(f"Directory does not exist: {directory}")
+
+        files = sorted(
+            path for path in directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+        summary = {"files_processed": 0, "files_failed": 0, "chunks_ingested": 0}
+
+        if not files:
+            logger.warning(
+                "No supported files found in directory",
+                directory=str(directory),
+                extensions=sorted(SUPPORTED_EXTENSIONS)
+            )
+            return summary
+
+        logger.info("Starting directory ingestion", directory=str(directory), file_count=len(files))
+
+        for file_path in files:
             try:
-                chunks = self.process_document(file_path)
-                all_chunks.extend(chunks)
-                successful_files += 1
-                
+                summary["chunks_ingested"] += self.ingest_document(
+                    source=str(file_path),
+                    file_name=file_path.name,
+                    file_size=file_path.stat().st_size,
+                    data=file_path.read_bytes()
+                )
+                summary["files_processed"] += 1
             except Exception as e:
+                summary["files_failed"] += 1
                 logger.error("Failed to process file", file_path=str(file_path), error=str(e))
-                continue
-        
-        if all_chunks:
-            self.ingest_to_pinecone(all_chunks)
-            
-            # Print summary
-            try:
-                index_stats = self.pinecone_index.describe_index_stats()
-                index_stats_dict = self._serialize_index_stats(index_stats)
-            except Exception as e:
-                logger.warning("Failed to get index stats", error=str(e))
-                index_stats_dict = {"error": "Unable to retrieve stats"}
-            
-            try:
-                logger.info(
-                    "Ingestion complete",
-                    files_processed=successful_files,
-                    total_files=len(text_files),
-                    chunks_ingested=len(all_chunks),
-                    index_stats=index_stats_dict
-                )
-            except Exception as e:
-                import traceback
-                logger.error("Failed to log completion message", error=str(e), traceback=traceback.format_exc())
-                # Fallback logging without index_stats
-                logger.info(
-                    "Ingestion complete (basic)",
-                    files_processed=successful_files,
-                    total_files=len(text_files),
-                    chunks_ingested=len(all_chunks)
-                )
-        else:
-            logger.warning("No chunks were successfully processed")
-    
-    def ingest_s3_bucket(self, bucket_name: str, prefix: str = ""):
+
+        self._log_summary("Ingestion complete", summary)
+        return summary
+
+    def ingest_s3_bucket(self, bucket_name: str, prefix: str = "") -> Dict[str, int]:
         """
-        Ingest documents from an S3 bucket.
-        
+        Ingest supported documents from an S3 bucket.
+
         Args:
             bucket_name: Name of the S3 bucket
             prefix: Optional prefix to filter objects
-        """
-        try:
-            s3_client = boto3.client('s3', region_name=self.settings.aws_region)
-            
-            # List objects in bucket
-            response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-            
-            if 'Contents' not in response:
-                logger.warning("No objects found in S3 bucket", bucket=bucket_name, prefix=prefix)
-                return
-            
-            objects = response['Contents']
-            text_objects = [obj for obj in objects if obj['Key'].endswith('.txt')]
-            
-            logger.info(
-                "Found text files in S3",
-                bucket=bucket_name,
-                prefix=prefix,
-                file_count=len(text_objects)
-            )
-            
-            all_chunks = []
-            successful_files = 0
-            
-            for obj in text_objects:
-                try:
-                    # Download file content
-                    response = s3_client.get_object(Bucket=bucket_name, Key=obj['Key'])
-                    content = response['Body'].read().decode('utf-8')
-                    
-                    # Create a document object
-                    doc = Document(page_content=content, metadata={"source": f"s3://{bucket_name}/{obj['Key']}"})
-                    
-                    # Split into chunks
-                    chunks = self.text_splitter.split_documents([doc])
-                    
-                    processed_chunks = []
-                    for i, chunk in enumerate(chunks):
-                        embedding = self.generate_embedding(chunk.page_content)
-                        doc_id = self.create_document_id(f"s3://{bucket_name}/{obj['Key']}", i)
-                        
-                        metadata = {
-                            "text": chunk.page_content,
-                            "source": f"s3://{bucket_name}/{obj['Key']}",
-                            "chunk_index": i,
-                            "total_chunks": len(chunks),
-                            "file_name": obj['Key'].split('/')[-1],
-                            "file_size": obj['Size'],
-                            "ingested_at": datetime.now(UTC).isoformat(),
-                            "text_length": len(chunk.page_content)
-                        }
-                        
-                        processed_chunks.append({
-                            "id": doc_id,
-                            "values": embedding,
-                            "metadata": metadata
-                        })
-                    
-                    all_chunks.extend(processed_chunks)
-                    successful_files += 1
-                    
-                    logger.info(
-                        "Processed S3 file",
-                        file_key=obj['Key'],
-                        chunks=len(processed_chunks)
-                    )
-                    
-                except Exception as e:
-                    logger.error("Failed to process S3 file", file_key=obj['Key'], error=str(e))
-                    continue
-            
-            if all_chunks:
-                self.ingest_to_pinecone(all_chunks)
-                
-                try:
-                    index_stats = self.pinecone_index.describe_index_stats()
-                    index_stats_dict = self._serialize_index_stats(index_stats)
-                except Exception as e:
-                    logger.warning("Failed to get index stats", error=str(e))
-                    index_stats_dict = {"error": "Unable to retrieve stats"}
-                    
-                logger.info(
-                    "S3 ingestion complete",
-                    files_processed=successful_files,
-                    total_files=len(text_objects),
-                    chunks_ingested=len(all_chunks),
-                    index_stats=index_stats_dict
-                )
-            else:
-                logger.warning("No chunks were successfully processed from S3")
-                
-        except Exception as e:
-            logger.error("Failed to ingest from S3", bucket=bucket_name, error=str(e))
-            raise
-    
-    def _serialize_index_stats(self, index_stats) -> Dict[str, Any]:
-        """
-        Safely serialize Pinecone index stats to avoid JSON serialization issues.
-        
-        Args:
-            index_stats: Pinecone index stats object
-            
+
         Returns:
-            Dictionary with serializable values
+            Summary with files_processed, files_failed and chunks_ingested
         """
-        try:
-            stats_dict = {
-                "total_vector_count": getattr(index_stats, 'total_vector_count', 0),
-                "dimension": getattr(index_stats, 'dimension', 0),
-                "index_fullness": getattr(index_stats, 'index_fullness', 0.0),
-            }
-            
-            # Handle namespaces safely
-            namespaces = getattr(index_stats, 'namespaces', {})
-            if namespaces:
-                # Convert namespace objects to simple dictionaries
-                namespace_dict = {}
-                for ns_name, ns_obj in namespaces.items():
-                    if hasattr(ns_obj, 'vector_count'):
-                        namespace_dict[ns_name] = {
-                            "vector_count": getattr(ns_obj, 'vector_count', 0)
-                        }
-                    else:
-                        # Fallback for simple values
-                        namespace_dict[ns_name] = str(ns_obj)
-                stats_dict["namespaces"] = namespace_dict
-            else:
-                stats_dict["namespaces"] = {}
-                
-            return stats_dict
-            
-        except Exception as e:
-            logger.warning("Failed to serialize index stats", error=str(e))
-            return {"error": "Unable to serialize stats", "raw_type": str(type(index_stats))}
+        s3_client = boto3.client('s3', region_name=self.settings.aws_region)
+
+        # list_objects_v2 returns at most 1000 keys per call; paginate
+        paginator = s3_client.get_paginator("list_objects_v2")
+        objects = [
+            obj
+            for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix)
+            for obj in page.get("Contents", [])
+            if pathlib.PurePosixPath(obj["Key"]).suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        summary = {"files_processed": 0, "files_failed": 0, "chunks_ingested": 0}
+
+        logger.info(
+            "Found supported files in S3",
+            bucket=bucket_name,
+            prefix=prefix,
+            file_count=len(objects)
+        )
+        if not objects:
+            return summary
+
+        for obj in objects:
+            key = obj["Key"]
+            try:
+                data = s3_client.get_object(Bucket=bucket_name, Key=key)["Body"].read()
+                summary["chunks_ingested"] += self.ingest_document(
+                    source=f"s3://{bucket_name}/{key}",
+                    file_name=key.split('/')[-1],
+                    file_size=obj["Size"],
+                    data=data
+                )
+                summary["files_processed"] += 1
+            except Exception as e:
+                summary["files_failed"] += 1
+                logger.error("Failed to process S3 file", file_key=key, error=str(e))
+
+        self._log_summary("S3 ingestion complete", summary)
+        return summary
 
 
 def main():
     """Main entry point for the ingestion script."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Ingest documents into the RAG pipeline")
     parser.add_argument(
         "--source-type",
@@ -511,26 +432,29 @@ def main():
         default="INFO",
         help="Logging level"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Configure logging level
     logging.basicConfig(level=getattr(logging, args.log_level))
-    
+
     try:
         ingester = DocumentIngester()
-        
+
         if args.source_type == "local":
-            ingester.ingest_directory(args.path)
-        elif args.source_type == "s3":
-            ingester.ingest_s3_bucket(args.path, args.s3_prefix)
-        
-        logger.info("Ingestion completed successfully")
-        
+            summary = ingester.ingest_directory(args.path)
+        else:
+            summary = ingester.ingest_s3_bucket(args.path, args.s3_prefix)
+
     except Exception as e:
         logger.error("Ingestion failed", error=str(e))
         sys.exit(1)
 
+    if summary["files_failed"]:
+        logger.error("Ingestion finished with failures", **summary)
+        sys.exit(1)
+    logger.info("Ingestion completed successfully", **summary)
+
 
 if __name__ == "__main__":
-    main() 
+    main()
