@@ -100,7 +100,7 @@ class RAGService:
             # Initialize Bedrock client
             self.bedrock_client = boto3.client(
                 "bedrock-runtime",
-                region_name=self.settings.aws_region
+                region_name=self.settings.bedrock_region
             )
             
             # Initialize Pinecone client
@@ -112,7 +112,7 @@ class RAGService:
             
             logger.info(
                 "Clients initialized successfully",
-                region=self.settings.aws_region,
+                bedrock_region=self.settings.bedrock_region,
                 index=self.settings.pinecone_index_name
             )
             
@@ -491,9 +491,20 @@ async def shutdown_event():
 
 # Dependency to get RAG service
 def get_rag_service() -> RAGService:
-    """Dependency to get the RAG service instance."""
+    """
+    Dependency to get the RAG service instance.
+
+    Created lazily when the startup event did not run (Mangum with
+    lifespan='off' on Lambda); the instance is then reused across warm
+    invocations of the same container.
+    """
+    global rag_service
     if rag_service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+        try:
+            rag_service = RAGService(get_settings())
+        except Exception as e:
+            logger.error("Failed to initialize RAG service", error=str(e))
+            raise HTTPException(status_code=503, detail="Service not initialized")
     return rag_service
 
 

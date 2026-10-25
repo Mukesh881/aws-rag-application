@@ -59,9 +59,9 @@ class DocumentIngester:
             # Initialize Bedrock client
             self.bedrock_client = boto3.client(
                 "bedrock-runtime",
-                region_name=self.settings.aws_region
+                region_name=self.settings.bedrock_region
             )
-            logger.info("Bedrock client initialized", region=self.settings.aws_region)
+            logger.info("Bedrock client initialized", region=self.settings.bedrock_region)
             
             # Initialize Pinecone client
             self.pinecone_client = Pinecone(
@@ -96,7 +96,7 @@ class DocumentIngester:
                 logger.error(
                     "Access denied to Bedrock. Ensure the model is enabled in your region",
                     model_id=self.settings.embed_model_id,
-                    region=self.settings.aws_region
+                    region=self.settings.bedrock_region
                 )
             raise
     

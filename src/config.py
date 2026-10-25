@@ -8,7 +8,7 @@ import os
 from functools import lru_cache
 from typing import Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -24,14 +24,22 @@ class Settings(BaseSettings):
     aws_secret_access_key: Optional[str] = Field(default=None, env="AWS_SECRET_ACCESS_KEY")
     
     # Bedrock Model Configuration
+    # Kept separate from AWS_REGION: Lambda sets AWS_REGION to the function's
+    # region, which may not serve the configured model / inference profile
+    # (e.g. a "us." profile cannot be invoked from ap-south-1).
+    bedrock_region: str = Field(
+        default="us-east-1",
+        validation_alias="BEDROCK_REGION",
+        description="Region for Bedrock runtime calls; must match the model ID's inference profile"
+    )
     embed_model_id: str = Field(
         default="amazon.titan-embed-text-v2:0",
-        env="BEDROCK_EMBED_MODEL_ID",
+        validation_alias=AliasChoices("BEDROCK_EMBED_MODEL_ID", "EMBED_MODEL_ID"),
         description="Bedrock embedding model ID"
     )
     llm_model_id: str = Field(
         default="us.anthropic.claude-sonnet-4-20250514-v1:0",
-        env="BEDROCK_LLM_MODEL_ID",
+        validation_alias=AliasChoices("BEDROCK_LLM_MODEL_ID", "LLM_MODEL_ID"),
         description="Bedrock LLM model ID"
     )
     
@@ -141,7 +149,7 @@ def get_bedrock_config() -> dict:
     """Get Bedrock model configuration."""
     settings = get_settings()
     return {
-        "region": settings.aws_region,
+        "region": settings.bedrock_region,
         "embed_model_id": settings.embed_model_id,
         "llm_model_id": settings.llm_model_id
     } 

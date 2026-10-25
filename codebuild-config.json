@@ -27,6 +27,11 @@
         "name": "IMAGE_REPO_NAME",
         "value": "rag-app",
         "type": "PLAINTEXT"
+      },
+      {
+        "name": "LAMBDA_FUNCTION_NAME",
+        "value": "rag-app-api",
+        "type": "PLAINTEXT"
       }
     ]
   },

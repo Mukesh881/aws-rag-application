@@ -44,6 +44,7 @@ The application requires the following environment variables:
 - `PINECONE_INDEX_NAME`: Pinecone index name (default: rag-documents)
 - `BEDROCK_EMBED_MODEL_ID`: Embedding model (default: amazon.titan-embed-text-v2:0)
 - `BEDROCK_LLM_MODEL_ID`: LLM model (default: us.anthropic.claude-sonnet-4-20250514-v1:0)
+- `BEDROCK_REGION`: Region for Bedrock calls, must match the LLM's inference profile prefix (default: us-east-1)
 - `LOG_LEVEL`: Logging level (default: INFO)
 
 ### AWS Credentials

@@ -11,6 +11,7 @@ services:
       - PYTHONPATH=/app
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - AWS_REGION=${AWS_REGION:-us-east-1}
+      - BEDROCK_REGION=${BEDROCK_REGION:-us-east-1}
       - PINECONE_API_KEY=${PINECONE_API_KEY:-placeholder_key}
       - PINECONE_ENVIRONMENT=${PINECONE_ENVIRONMENT:-us-east-1-aws}
       - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-rag-documents}

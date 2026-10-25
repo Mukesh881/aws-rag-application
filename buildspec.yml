@@ -2,27 +2,36 @@ version: 0.2
 
 phases:
   pre_build:
+    on-failure: ABORT
     commands:
       - echo "Build started on $(date)"
       - echo "Building commit $CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - 'echo "Target Lambda function: ${LAMBDA_FUNCTION_NAME:?LAMBDA_FUNCTION_NAME must be set on the CodeBuild project}"'
       - echo "Logging in to Amazon ECR..."
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
       - echo "Image will be tagged as $IMAGE_TAG"
-      
+
   build:
+    # Without ABORT, CodeBuild still runs post_build after a failed build
+    on-failure: ABORT
     commands:
       - echo "Building Docker image..."
       - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG -f deployment/docker/Dockerfile.lambda .
       - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
       - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:latest
-      
+
   post_build:
     commands:
       - echo "Pushing Docker images to ECR..."
       - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
       - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:latest
+      # Deploy the commit-tagged image (not :latest) and publish an immutable
+      # version, so a rollback is just pointing back at the previous version
+      - echo "Deploying image to Lambda function $LAMBDA_FUNCTION_NAME..."
+      - aws lambda update-function-code --function-name "$LAMBDA_FUNCTION_NAME" --image-uri $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG --publish
+      - aws lambda wait function-updated-v2 --function-name "$LAMBDA_FUNCTION_NAME"
       - echo "Creating deployment artifact..."
       - printf '[{\"name\":\"rag-app-api\",\"imageUri\":\"%s\"}]' $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG > imagedefinitions.json
       - echo "Build completed on $(date)"
